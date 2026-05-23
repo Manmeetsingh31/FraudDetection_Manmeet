@@ -152,9 +152,6 @@ Run all cells — this trains the model and generates `dashboard/model.pkl` and 
 
 ```bash
 streamlit run dashboard/app.py
-```
-
-Opens at → **http://localhost:8501**
 
 ---
 
