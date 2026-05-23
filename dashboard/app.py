@@ -36,6 +36,7 @@ ROOT      = os.path.dirname(HERE)
 MODEL_PKG = os.path.join(HERE, "model.pkl")
 DATA_TX   = os.path.join(ROOT, "data", "train_transaction.csv")
 DATA_ID   = os.path.join(ROOT, "data", "train_identity.csv")
+DATA_AVAILABLE = os.path.exists(DATA_TX) and os.path.exists(DATA_ID)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -70,31 +71,74 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── Helper functions (defined early — load_data uses risk_tier) ───────────────
+def risk_tier(p: float) -> str:
+    if p >= 0.75:   return "🔴 Critical Risk"
+    elif p >= 0.40: return "🟡 Suspicious"
+    else:           return "🟢 Clear"
+
+
+def tier_color(tier: str) -> str:
+    return {"🔴 Critical Risk": "#EF5350",
+            "🟡 Suspicious":    "#FFA726",
+            "🟢 Clear":         "#66BB6A"}.get(tier, "#9E9E9E")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Data & model loading — cached so they only run once
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner="Loading data…")
 def load_data():
-    """Merge transaction + identity tables and compute basic features."""
-    tx  = pd.read_csv(DATA_TX)
-    idf = pd.read_csv(DATA_ID)
-    df  = tx.merge(idf, on="TransactionID", how="left")
-
-    # Engineered features (must match notebook)
-    mean_amt = df["TransactionAmt"].mean()
-    df["AmtToMeanRatio"] = (df["TransactionAmt"] / mean_amt).round(4)
-    df["HourOfDay"]      = ((df["TransactionDT"] % 86_400) // 3600).astype(int)
-
-    if "DeviceType" in df.columns and "id_01" in df.columns:
-        df["DeviceRisk"] = (
-            (df["DeviceType"] == "mobile") &
-            (df["id_01"].fillna(0) < 0)
-        ).astype(int)
+    """Load data — from CSVs if available, otherwise from pre-scored data in model.pkl."""
+    if DATA_AVAILABLE:
+        tx  = pd.read_csv(DATA_TX)
+        idf = pd.read_csv(DATA_ID)
+        df  = tx.merge(idf, on="TransactionID", how="left")
+        mean_amt = df["TransactionAmt"].mean()
+        df["AmtToMeanRatio"] = (df["TransactionAmt"] / mean_amt).round(4)
+        df["HourOfDay"]      = ((df["TransactionDT"] % 86_400) // 3600).astype(int)
+        if "DeviceType" in df.columns and "id_01" in df.columns:
+            df["DeviceRisk"] = (
+                (df["DeviceType"] == "mobile") &
+                (df["id_01"].fillna(0) < 0)
+            ).astype(int)
+        else:
+            df["DeviceRisk"] = 0
+        return df
     else:
-        df["DeviceRisk"] = 0
-
-    return df
+        # CSVs not present (Streamlit Cloud) — load pre-scored snapshot from model.pkl
+        pkg_path = MODEL_PKG
+        if not os.path.exists(pkg_path):
+            st.error("Neither data CSVs nor model.pkl found. Cannot load data.")
+            st.stop()
+        with open(pkg_path, "rb") as f:
+            pkg = pickle.load(f)
+        if "scored_df" in pkg:
+            return pkg["scored_df"]
+        # Fallback: synthesise a minimal demo dataframe from the model's feature list
+        rng = np.random.default_rng(42)
+        n   = 5000
+        features = pkg.get("features", [])
+        df = pd.DataFrame(rng.standard_normal((n, len(features))), columns=features)
+        df["TransactionID"]  = np.arange(2987000, 2987000 + n)
+        df["TransactionAmt"] = np.abs(rng.normal(150, 200, n)).clip(1)
+        df["HourOfDay"]      = rng.integers(0, 24, n)
+        df["AmtToMeanRatio"] = df["TransactionAmt"] / df["TransactionAmt"].mean()
+        df["DeviceRisk"]     = rng.integers(0, 2, n)
+        df["isFraud"]        = rng.choice([0, 1], n, p=[0.965, 0.035])
+        model = pkg.get("model")
+        threshold = pkg.get("threshold", 0.5)
+        scaler    = pkg.get("scaler")
+        scale_cols= pkg.get("scale_cols", [])
+        X = df.reindex(columns=features, fill_value=0)
+        valid_scale = [c for c in scale_cols if c in X.columns]
+        if scaler and valid_scale:
+            X[valid_scale] = scaler.transform(X[valid_scale])
+        df["FraudProba"] = model.predict_proba(X)[:, 1]
+        df["FraudPred"]  = (df["FraudProba"] >= threshold).astype(int)
+        df["RiskTier"]   = df["FraudProba"].apply(risk_tier)
+        return df
 
 
 @st.cache_resource(show_spinner="Loading model…")
@@ -142,18 +186,6 @@ def preprocess_row(row: pd.Series, pkg: dict) -> pd.DataFrame:
         df_row[valid_scale] = scaler.transform(df_row[valid_scale])
 
     return df_row
-
-
-def risk_tier(p: float) -> str:
-    if p >= 0.75:   return "🔴 Critical Risk"
-    elif p >= 0.40: return "🟡 Suspicious"
-    else:           return "🟢 Clear"
-
-
-def tier_color(tier: str) -> str:
-    return {"🔴 Critical Risk": "#EF5350",
-            "🟡 Suspicious":    "#FFA726",
-            "🟢 Clear":         "#66BB6A"}.get(tier, "#9E9E9E")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
